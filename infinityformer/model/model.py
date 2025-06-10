@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple, List, Union, Dict, Any
 from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.generation import GenerationMixin
 
 from ..config import InfinityFormerConfig
 
@@ -191,8 +192,9 @@ class InfinityFormerEmbeddings(nn.Module):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-    ) -> torch.Tensor:
+    ):
         """
+    
         Args:
             input_ids: [batch_size, seq_len]
             position_ids: [batch_size, seq_len]
@@ -207,10 +209,23 @@ class InfinityFormerEmbeddings(nn.Module):
             input_shape = inputs_embeds.size()[:-1]
         
         seq_length = input_shape[1]
-        
+        max_pos_embed = self.position_embeddings.num_embeddings
+
+        # Truncate inputs if they are longer than max_position_embeddings
+        if seq_length > max_pos_embed:
+            if input_ids is not None:
+                input_ids = input_ids[:, :max_pos_embed]
+            if inputs_embeds is not None:
+                inputs_embeds = inputs_embeds[:, :max_pos_embed, :]
+            seq_length = max_pos_embed
+
         if position_ids is None:
             position_ids = self.position_ids[:, :seq_length]
-        
+        else:
+            # Even if position_ids are provided, they cannot be longer than the model's max length
+            if position_ids.shape[1] > seq_length:
+                position_ids = position_ids[:, :seq_length]
+
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
         
@@ -277,6 +292,23 @@ class InfinityFormerModel(nn.Module):
         return_dict: Optional[bool] = None,
         **kwargs
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+
+        if input_ids is not None:
+            seq_length = input_ids.shape[1]
+        elif inputs_embeds is not None:
+            seq_length = inputs_embeds.shape[1]
+        else:
+            # When using cache, input_ids and inputs_embeds can be None, and seq_length is 1
+            seq_length = 0
+
+        max_pos_embed = self.config.max_position_embeddings
+        if seq_length > max_pos_embed:
+            if attention_mask is not None:
+                if attention_mask.dim() == 4:
+                    attention_mask = attention_mask[:, :, :, :max_pos_embed]
+                elif attention_mask.dim() == 2:
+                    attention_mask = attention_mask[:, :max_pos_embed]
+
         """
         Args:
             input_ids: [batch_size, seq_len]
@@ -452,7 +484,7 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 from ..config import InfinityFormerConfig # Ensure this import is correct relative to your project structure
 
-class InfinityFormerForCausalLM(PreTrainedModel):
+class InfinityFormerForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = InfinityFormerConfig
     base_model_prefix = "infinity_former"
 

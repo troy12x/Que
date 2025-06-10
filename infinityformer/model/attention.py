@@ -89,13 +89,7 @@ class MultiScaleMemory(nn.Module):
         self.register_buffer("memory", None, persistent=False)
 
         # Debug prints for initialization
-        print(f"[DEBUG MSM Init] Layer {self.layer_idx}: config.num_memory_scales: {config.num_memory_scales}")
-        print(f"[DEBUG MSM Init] Layer {self.layer_idx}: self.num_scales: {self.num_scales}")
-        print(f"[DEBUG MSM Init] Layer {self.layer_idx}: num_heads: {self.num_heads}, head_dim: {self.head_dim}")
-        if self.memory is not None:
-            print(f"[DEBUG MSM Init] Layer {self.layer_idx}: self.memory.shape (if initialized): {self.memory.shape}")
-        else:
-            print(f"[DEBUG MSM Init] Layer {self.layer_idx}: self.memory is initially None")
+
         
     def init_memory(self, batch_size: int, device: torch.device) -> None:
         """Initialize memory states."""
@@ -105,7 +99,7 @@ class MultiScaleMemory(nn.Module):
             batch_size, self.num_scales, self.num_heads, self.head_dim, self.head_dim,
             device=device
         )
-        print(f"[DEBUG MSM Init_Mem] Layer {self.layer_idx}: self.memory.shape after init: {self.memory.shape}")
+
         
     def compress_memory(self) -> None:
         """Compress the memory using SVD-based compression."""
@@ -204,7 +198,7 @@ class MultiScaleMemory(nn.Module):
         # self.memory: [batch_size, num_scales, num_heads, head_dim_k, head_dim_v]
         self.memory = self.memory.detach() * decay_factors_sig + (1.0 - decay_factors_sig) * new_info_chunk_expanded
         
-        print(f"[DEBUG MSM Update_Mem] Layer {self.layer_idx}: self.memory.shape after update: {self.memory.shape}")
+
 
         self.step_counter += 1
         if self.training and self.compression_frequency > 0 and self.step_counter % self.compression_frequency == 0:
@@ -230,13 +224,12 @@ class MultiScaleMemory(nn.Module):
         
         if hasattr(self, 'compressed_memory') and self.memory is None:
             self.decompress_memory(q.device) # Ensure memory is available
-        
-        # Debug prints
-        print(f"[DEBUG MSM Fwd] Layer {self.layer_idx}: self.num_scales: {self.num_scales}")
-        print(f"[DEBUG MSM Fwd] Layer {self.layer_idx}: q.shape (original): {q.shape}")
-        # self.memory shape is [batch_size, num_scales, num_heads, head_dim_k, head_dim_value]
-        print(f"[DEBUG MSM Fwd] Layer {self.layer_idx}: self.memory.shape (for 'bmnkv'): {self.memory.shape}")
 
+        # FIX: Check and correct memory state batch size if it differs from the query's batch size.
+        # This is critical when switching from a larger training batch to a smaller evaluation batch.
+        if self.memory.shape[0] != q.shape[0]:
+            self.memory = self.memory[:q.shape[0], ...]
+        
         # Einsum for attention computation with memory
         # q (query):           [batch_size (b), seq_len (s), num_heads (n), head_dim_key (k)]
         # self.memory (memory): [batch_size (b), num_memory_scales (m), num_heads (n), head_dim_key (k), head_dim_value (v)]
@@ -358,10 +351,12 @@ class LinearAttention(nn.Module):
         # Update memory with current key-value pairs if memory is enabled
         if self.use_memory:
             self.memory.update_memory(k, v, attention_mask.squeeze(1).squeeze(1) if attention_mask is not None else None)
-            
-            # Get output from memory
-            memory_output = self.memory(q)
-            
+
+            # Get output from memory and unpack the tuple
+            memory_output, _ = self.memory(q)
+
+
+
             # Apply gating to combine context and memory outputs
             if self.use_gating:
                 # Compute gate values
@@ -370,12 +365,12 @@ class LinearAttention(nn.Module):
                     gate_input = gate_input * attention_mask.squeeze(1).transpose(-1, -2).float()
                 gate = torch.sigmoid(self.gate(gate_input))  # [batch_size, seq_len, 1]
                 gate = gate.unsqueeze(-1)  # [batch_size, seq_len, 1, 1]
-                
+
                 # Combine outputs using the gate
-                output = gate * context_output + (1 - gate) * memory_output[0].to(gate.dtype)
+                output = gate * context_output + (1 - gate) * memory_output
             else:
-                # Simple average if gating is disabled
-                output = (context_output + memory_output) / 2
+                # Combine by simple addition
+                output = context_output + memory_output
         else:
             output = context_output
         

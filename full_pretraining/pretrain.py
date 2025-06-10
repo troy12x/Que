@@ -1,30 +1,29 @@
 import os
+import sys
 import argparse
 import logging
 import torch
+
+# Add project root to sys.path to allow for local package imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 import wandb
-from tqdm import tqdm
-import sys
-
-# Add project root to sys.path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer, get_scheduler
 from datasets import load_dataset as hf_load_dataset
 
-from infinityformer import (
-    InfinityFormerConfig,
-    InfinityFormerForCausalLM,
-)
+# Local imports
+from infinityformer.model import InfinityFormerConfig, InfinityFormerForCausalLM
+from evaluate import run_mmlu_evaluation
 from infinityformer.utils import (
-    load_dataset,
     DataCollatorForLanguageModeling,
-    get_optimizer,
+    get_optimizer
 )
+
 
 # --- Distributed Training Setup ---
 def setup_distributed():
@@ -48,6 +47,27 @@ def is_main_process(single_gpu_mode=False):
 
 # --- Logging Setup ---
 logger = logging.getLogger(__name__)
+
+
+# --- Checkpoint Saving ---
+def save_checkpoint(model, tokenizer, args, global_step):
+    """Saves model, tokenizer, and arguments to a checkpoint directory."""
+    checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    logger.info(f"Saving model checkpoint to {checkpoint_dir}")
+
+    # Unwrap the model if using DDP
+    model_to_save = model.module if hasattr(model, 'module') else model
+
+    # Save model and tokenizer using Hugging Face's `save_pretrained`
+    # safe_serialization=False is required for models with tied weights like this one.
+    model_to_save.save_pretrained(checkpoint_dir, safe_serialization=False)
+    tokenizer.save_pretrained(checkpoint_dir)
+
+    # Save training arguments for easy resuming
+    torch.save(args, os.path.join(checkpoint_dir, "training_args.bin"))
+    logger.info(f"Checkpoint saved successfully to {checkpoint_dir}")
 
 def setup_logging(single_gpu_mode=False):
     """Sets up logging, restricting verbose logs to the main process."""
@@ -80,7 +100,9 @@ def parse_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Peak learning rate.")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay.")
-    parser.add_argument("--num_train_epochs", type=int, default=1, help="Number of training epochs.")
+    parser.add_argument("--num_train_epochs", type=int, default=1, help="Total number of training epochs to perform.")
+    parser.add_argument("--mmlu_eval_steps", type=int, default=200, help="Run MMLU evaluation every N steps. Disabled if 0.")
+    parser.add_argument("--mmlu_limit_subjects", type=int, default=5, help="Limit MMLU eval to N subjects for a quick check during training. -1 for all.")
     parser.add_argument("--max_train_steps", type=int, default=None, help="Override num_train_epochs.")
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", help="LR scheduler type.")
     parser.add_argument("--num_warmup_steps", type=int, default=1000, help="Number of warmup steps.")
@@ -91,7 +113,7 @@ def parse_args():
     
     # Checkpointing & Logging
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint to resume from.")
-    parser.add_argument("--checkpointing_steps", type=int, default=500, help="Save checkpoint every N steps.")
+    parser.add_argument("--checkpointing_steps", type=int, default=100, help="Save checkpoint every N steps.")
     parser.add_argument("--logging_steps", type=int, default=10, help="Log every N steps.")
     parser.add_argument("--wandb_project", type=str, default="infinityformer-pretraining", help="Weights & Biases project name.")
     parser.add_argument("--single_gpu", action="store_true", help="Run on a single GPU without distributed training for testing.")
@@ -145,22 +167,31 @@ def main():
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     
-    if args.single_gpu:
-        train_sampler = RandomSampler(train_dataset)
-        eval_sampler = SequentialSampler(eval_dataset)
-    else:
-        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
-        eval_sampler = DistributedSampler(eval_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
-
+    train_sampler = RandomSampler(train_dataset) if args.single_gpu else DistributedSampler(train_dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
     train_dataloader = DataLoader(train_dataset, batch_size=args.per_device_train_batch_size, sampler=train_sampler, collate_fn=data_collator, num_workers=args.preprocessing_num_workers)
-    eval_dataloader = DataLoader(eval_dataset, batch_size=args.per_device_eval_batch_size, sampler=eval_sampler, collate_fn=data_collator, num_workers=args.preprocessing_num_workers)
+
+    eval_dataloader = None
+    if eval_dataset:
+        eval_sampler = SequentialSampler(eval_dataset) if args.single_gpu else DistributedSampler(eval_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
+        eval_dataloader = DataLoader(eval_dataset, batch_size=args.per_device_eval_batch_size, sampler=eval_sampler, collate_fn=data_collator, num_workers=args.preprocessing_num_workers)
 
     logger.info("Initializing model...")
     if args.model_config_name:
         config = InfinityFormerConfig.from_pretrained(args.model_config_name)
-    else:
+    elif args.single_gpu:
+        logger.info("Using a small model configuration for single-GPU testing.")
         config = InfinityFormerConfig(
-            vocab_size=tokenizer.vocab_size,
+            vocab_size=len(tokenizer),
+            hidden_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            intermediate_size=512,  # 4 * hidden_size
+            max_position_embeddings=args.max_seq_length,
+        )
+    else:
+        logger.info("Using default ~500M parameter model configuration.")
+        config = InfinityFormerConfig(
+            vocab_size=len(tokenizer),
             hidden_size=768,
             num_hidden_layers=54,
             num_attention_heads=12,
@@ -216,7 +247,7 @@ def main():
         for step, batch in enumerate(train_dataloader):
             batch = {k: v.to(device) for k, v in batch.items()}
             
-            with torch.cuda.amp.autocast(dtype=autocast_dtype):
+            with torch.amp.autocast(device_type='cuda', dtype=autocast_dtype):
                 outputs = model(**batch)
                 loss = outputs.loss
                 loss = loss / args.gradient_accumulation_steps
@@ -232,52 +263,60 @@ def main():
                 progress_bar.update(args.gradient_accumulation_steps)
 
                 if is_main_process(args.single_gpu) and global_step % args.logging_steps == 0:
+                    train_loss = loss.item() * args.gradient_accumulation_steps
+                    lr = lr_scheduler.get_last_lr()[0]
                     wandb.log({
-                        "train/loss": loss.item() * args.gradient_accumulation_steps,
-                        "train/learning_rate": lr_scheduler.get_last_lr()[0],
+                        "train/loss": train_loss,
+                        "train/learning_rate": lr,
                         "trainer/global_step": global_step,
                         "epoch": epoch
                     })
+                    tqdm.write(f"Step: {global_step} | Loss: {train_loss:.4f} | LR: {lr:.2e}")
 
-                if global_step % args.checkpointing_steps == 0:
+                if global_step > 0 and global_step % args.checkpointing_steps == 0:
                     if is_main_process(args.single_gpu):
-                        checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        os.makedirs(checkpoint_dir, exist_ok=True)
-                        logger.info(f"Saving checkpoint to {checkpoint_dir}")
-                        model_to_save = model.module if not args.single_gpu else model
-                        torch.save({
-                            'epoch': epoch,
-                            'global_step': global_step,
-                            'model_state_dict': model_to_save.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': lr_scheduler.state_dict(),
-                            'args': args
-                        }, os.path.join(checkpoint_dir, "pytorch_model.bin"))
-                
+                        save_checkpoint(model, tokenizer, args, global_step)
+
+                if args.mmlu_eval_steps > 0 and global_step > 0 and global_step % args.mmlu_eval_steps == 0:
+                    if is_main_process(args.single_gpu):
+                        tqdm.write(f"\n--- Running MMLU Evaluation at step {global_step} ---")
+                        mmlu_accuracy = run_mmlu_evaluation(
+                            model=model,
+                            tokenizer=tokenizer,
+                            device=device,
+                            limit_subjects=args.mmlu_limit_subjects
+                        )
+                        tqdm.write(f"--- MMLU Eval complete. Accuracy: {mmlu_accuracy:.4f} ---\n")
+                        wandb.log({
+                            "eval/mmlu_accuracy": mmlu_accuracy,
+                            "trainer/global_step": global_step
+                        })
+
                 if global_step >= args.max_train_steps:
                     break
         
-        model.eval()
-        eval_losses = []
-        for batch in tqdm(eval_dataloader, disable=not is_main_process(args.single_gpu), desc="Evaluating"):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(dtype=autocast_dtype):
-                    outputs = model(**batch)
-                    loss = outputs.loss
-            eval_losses.append(loss.unsqueeze(0))
-        
-        if not args.single_gpu:
-            all_eval_losses = [torch.zeros_like(eval_losses[0]) for _ in range(world_size)]
-            dist.all_gather(all_eval_losses, torch.cat(eval_losses, dim=0).mean().unsqueeze(0))
-            avg_eval_loss = torch.cat(all_eval_losses).mean().item()
-        else:
-            avg_eval_loss = torch.cat(eval_losses).mean().item()
-        
-        if is_main_process(args.single_gpu):
-            perplexity = torch.exp(torch.tensor(avg_eval_loss)).item()
-            logger.info(f"Epoch {epoch+1} Eval Loss: {avg_eval_loss:.4f}, Perplexity: {perplexity:.4f}")
-            wandb.log({"eval/loss": avg_eval_loss, "eval/perplexity": perplexity, "epoch": epoch + 1})
+        if eval_dataloader:
+            model.eval()
+            eval_losses = []
+            for batch in tqdm(eval_dataloader, disable=not is_main_process(args.single_gpu), desc="Evaluating"):
+                batch = {k: v.to(device) for k, v in batch.items()}
+                with torch.no_grad():
+                    with torch.amp.autocast(device_type='cuda', dtype=autocast_dtype):
+                        outputs = model(**batch)
+                        loss = outputs.loss
+                eval_losses.append(loss.unsqueeze(0))
+            
+            if not args.single_gpu:
+                all_eval_losses = [torch.zeros_like(eval_losses[0]) for _ in range(world_size)]
+                dist.all_gather(all_eval_losses, torch.cat(eval_losses, dim=0).mean().unsqueeze(0))
+                avg_eval_loss = torch.cat(all_eval_losses).mean().item()
+            else:
+                avg_eval_loss = torch.cat(eval_losses).mean().item()
+            
+            if is_main_process(args.single_gpu):
+                perplexity = torch.exp(torch.tensor(avg_eval_loss)).item()
+                logger.info(f"Epoch {epoch+1} Eval Loss: {avg_eval_loss:.4f}, Perplexity: {perplexity:.4f}")
+                wandb.log({"eval/loss": avg_eval_loss, "eval/perplexity": perplexity, "epoch": epoch + 1})
 
         if global_step >= args.max_train_steps:
             break
@@ -292,7 +331,7 @@ def main():
         model_to_save.config.to_json_file(os.path.join(final_checkpoint_dir, "config.json"))
 
     if not args.single_gpu:
-        cleanup_distributed()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
