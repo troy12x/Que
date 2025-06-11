@@ -88,6 +88,72 @@ def run_mmlu_evaluation(model, tokenizer, device, limit_subjects=-1):
     model.train()  # IMPORTANT: Set model back to training mode
     return avg_accuracy
 
+def calculate_sequence_loss(model, tokenizer, text, device):
+    """
+    Calculates the cross-entropy loss for a given sequence of text.
+    Lower loss indicates higher probability under the model.
+    """
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=model.config.max_position_embeddings).to(device)
+    input_ids = inputs["input_ids"]
+    
+    # Labels are the same as input_ids, but shifted
+    # The loss function in the model will handle the shifting internally
+    labels = input_ids.clone()
+
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, labels=labels)
+        loss = outputs.loss
+    
+    return loss.item()
+
+
+def run_piqa_evaluation(model, tokenizer, device):
+    """
+    Runs PIQA evaluation on a given model and tokenizer.
+
+    Args:
+        model: The Hugging Face model to evaluate.
+        tokenizer: The tokenizer associated with the model.
+        device: The torch device to run on ('cuda' or 'cpu').
+
+    Returns:
+        float: The accuracy on the PIQA validation set.
+    """
+    model.eval()
+    print("\n--- Running PIQA Evaluation ---")
+    
+    try:
+        # Using the validation split as the test set labels are not public.
+        dataset = load_dataset("baber/piqa", split="validation", trust_remote_code=True)
+    except Exception as e:
+        print(f"Error loading PIQA dataset: {e}. Skipping evaluation.")
+        model.train()
+        return 0.0
+
+    correct_predictions = 0
+    total_predictions = 0
+
+    for example in tqdm(dataset, desc="Evaluating PIQA"):
+        goal = example['goal']
+        
+        # Calculate loss for both solutions
+        # A lower loss means the model finds the sequence more plausible.
+        loss1 = calculate_sequence_loss(model, tokenizer, f"{goal} {example['sol1']}", device)
+        loss2 = calculate_sequence_loss(model, tokenizer, f"{goal} {example['sol2']}", device)
+
+        # Predict the solution with the lower loss
+        prediction = 0 if loss1 < loss2 else 1
+        
+        if prediction == example['label']:
+            correct_predictions += 1
+        total_predictions += 1
+
+    accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
+    print(f"--- PIQA Eval complete. Accuracy: {accuracy:.4f} ---")
+    
+    model.train() # IMPORTANT: Set model back to training mode
+    return accuracy
+
 # --- Standalone Execution Logic ---
 def evaluate_from_path(args):
     """Loads a model from a path and runs the MMLU evaluation."""

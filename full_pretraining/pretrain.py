@@ -18,7 +18,7 @@ from datasets import load_dataset as hf_load_dataset
 
 # Local imports
 from infinityformer.model import InfinityFormerConfig, InfinityFormerForCausalLM
-from evaluate import run_mmlu_evaluation
+from evaluate import run_mmlu_evaluation, run_piqa_evaluation
 from infinityformer.utils import (
     DataCollatorForLanguageModeling,
     get_optimizer
@@ -102,7 +102,8 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay.")
     parser.add_argument("--num_train_epochs", type=int, default=1, help="Total number of training epochs to perform.")
     parser.add_argument("--mmlu_eval_steps", type=int, default=200, help="Run MMLU evaluation every N steps. Disabled if 0.")
-    parser.add_argument("--mmlu_limit_subjects", type=int, default=5, help="Limit MMLU eval to N subjects for a quick check during training. -1 for all.")
+    parser.add_argument("--mmlu_limit_subjects", type=int, default=-1, help="Limit MMLU to the first N subjects for quick testing.")
+    parser.add_argument("--piqa_eval_steps", type=int, default=200, help="Run PIQA evaluation every N steps. Disabled if 0.")
     parser.add_argument("--max_train_steps", type=int, default=None, help="Override num_train_epochs.")
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", help="LR scheduler type.")
     parser.add_argument("--num_warmup_steps", type=int, default=1000, help="Number of warmup steps.")
@@ -289,6 +290,18 @@ def main():
                         tqdm.write(f"--- MMLU Eval complete. Accuracy: {mmlu_accuracy:.4f} ---\n")
                         wandb.log({
                             "eval/mmlu_accuracy": mmlu_accuracy,
+                            "trainer/global_step": global_step
+                        })
+
+                if args.piqa_eval_steps > 0 and global_step > 0 and global_step % args.piqa_eval_steps == 0:
+                    if is_main_process(args.single_gpu):
+                        piqa_accuracy = run_piqa_evaluation(
+                            model=model,
+                            tokenizer=tokenizer,
+                            device=device
+                        )
+                        wandb.log({
+                            "eval/piqa_accuracy": piqa_accuracy,
                             "trainer/global_step": global_step
                         })
 
