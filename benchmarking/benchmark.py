@@ -94,7 +94,7 @@ if __name__ == "__main__":
 
     # --- Benchmark Execution ---
     # Sequence lengths to test, similar to the paper's graph
-    sequence_lengths_to_test = [3096]
+    sequence_lengths_to_test = [4096, 8192, 16384, 32768]
 
     benchmark_throughput(
         model=model,
