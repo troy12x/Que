@@ -365,7 +365,7 @@ class InfinityFormerModel(nn.Module):
 
             layer_input_past_key_value = past_key_values[i] if past_key_values is not None else (None, None)
             
-            if self.training and self.config.use_gradient_checkpointing and hasattr(torch.utils.checkpoint, 'checkpoint') and self.config.is_gradient_checkpointing:
+            if self.training and self.config.use_gradient_checkpointing and hasattr(torch.utils.checkpoint, 'checkpoint'):
                 # Define a custom forward function for checkpointing
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
