@@ -219,7 +219,10 @@ def main():
 
     model = InfinityFormerForCausalLM(config).to(device)
     if not args.single_gpu:
-        model = DDP(model, device_ids=[local_rank])
+        # For debugging purposes, we are forcing find_unused_parameters=True.
+        # This will help identify which parameters are not receiving gradients.
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        # This will print the names of parameters that are not used in the forward pass.
 
     optimizer = get_optimizer(model, args.learning_rate, args.weight_decay)
     
