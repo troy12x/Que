@@ -18,6 +18,7 @@ from datasets import load_dataset as hf_load_dataset
 
 # Local imports
 from infinityformer.model import InfinityFormerConfig, InfinityFormerForCausalLM
+from huggingface_hub import create_repo
 from evaluate import run_mmlu_evaluation, run_piqa_evaluation
 from infinityformer.utils import (
     DataCollatorForLanguageModeling,
@@ -101,9 +102,9 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Peak learning rate.")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay.")
     parser.add_argument("--num_train_epochs", type=int, default=1, help="Total number of training epochs to perform.")
-    parser.add_argument("--mmlu_eval_steps", type=int, default=200, help="Run MMLU evaluation every N steps. Disabled if 0.")
+    parser.add_argument("--mmlu_eval_steps", type=int, default=1000, help="Run MMLU evaluation every N steps. Disabled if 0.")
     parser.add_argument("--mmlu_limit_subjects", type=int, default=-1, help="Limit MMLU to the first N subjects for quick testing.")
-    parser.add_argument("--piqa_eval_steps", type=int, default=200, help="Run PIQA evaluation every N steps. Disabled if 0.")
+    parser.add_argument("--piqa_eval_steps", type=int, default=1000, help="Run PIQA evaluation every N steps. Disabled if 0.")
     parser.add_argument("--max_train_steps", type=int, default=None, help="Override num_train_epochs.")
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", help="LR scheduler type.")
     parser.add_argument("--num_warmup_steps", type=int, default=1000, help="Number of warmup steps.")
@@ -114,10 +115,15 @@ def parse_args():
     
     # Checkpointing & Logging
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint to resume from.")
-    parser.add_argument("--checkpointing_steps", type=int, default=100, help="Save checkpoint every N steps.")
-    parser.add_argument("--logging_steps", type=int, default=10, help="Log every N steps.")
+    parser.add_argument("--checkpointing_steps", type=int, default=1000, help="Save checkpoint every N steps.")
+    parser.add_argument("--logging_steps", type=int, default=5, help="Log every N steps.")
     parser.add_argument("--wandb_project", type=str, default="infinityformer-pretraining", help="Weights & Biases project name.")
     parser.add_argument("--single_gpu", action="store_true", help="Run on a single GPU without distributed training for testing.")
+
+    # Hub arguments
+    parser.add_argument("--push_to_hub", action="store_true", help="Push checkpoints to the Hugging Face Hub.")
+    parser.add_argument("--hub_model_id", type=str, default=None, help="The model ID (repository name) on the Hugging Face Hub.")
+    parser.add_argument("--hub_private_repo", action="store_true", help="Create a private repository on the Hub.")
 
     args = parser.parse_args()
     return args
@@ -143,6 +149,14 @@ def main():
 
     if is_main_process(args.single_gpu):
         os.makedirs(args.output_dir, exist_ok=True)
+        if args.push_to_hub and is_main_process(args.single_gpu):
+            if args.hub_model_id is None:
+                raise ValueError("Must specify --hub_model_id when pushing to the Hub.")
+            print(f"Pushing checkpoints to repository: {args.hub_model_id}")
+            # Use HUGGING_FACE_HUB_TOKEN environment variable or `huggingface-cli login`
+            create_repo(args.hub_model_id, private=args.hub_private_repo, exist_ok=True)
+
+    if is_main_process(args.single_gpu):
         wandb.init(project=args.wandb_project, config=args)
 
     logger.info(f"Loading tokenizer: {args.tokenizer_name}")
@@ -276,7 +290,31 @@ def main():
 
                 if global_step > 0 and global_step % args.checkpointing_steps == 0:
                     if is_main_process(args.single_gpu):
-                        save_checkpoint(model, tokenizer, args, global_step)
+                        # Save locally first
+                        checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        model.save_pretrained(checkpoint_dir, safe_serialization=True)
+                        tokenizer.save_pretrained(checkpoint_dir)
+                        tqdm.write(f"Saved checkpoint to {checkpoint_dir}")
+
+                        # Push to Hub if enabled
+                        if args.push_to_hub:
+                            try:
+                                tqdm.write(f"Pushing checkpoint-{global_step} to the Hub...")
+                                # The push_to_hub function will use the logged-in user or env token
+                                model.push_to_hub(
+                                    repo_id=args.hub_model_id,
+                                    commit_message=f"Training checkpoint {global_step}",
+                                    private=args.hub_private_repo,
+                                    safe_serialization=True
+                                )
+                                tokenizer.push_to_hub(
+                                    repo_id=args.hub_model_id,
+                                    commit_message=f"Training checkpoint {global_step}",
+                                    private=args.hub_private_repo
+                                )
+                                tqdm.write(f"Successfully pushed to {args.hub_model_id}")
+                            except Exception as e:
+                                tqdm.write(f"Failed to push to Hub: {e}")
 
                 if args.mmlu_eval_steps > 0 and global_step > 0 and global_step % args.mmlu_eval_steps == 0:
                     if is_main_process(args.single_gpu):
