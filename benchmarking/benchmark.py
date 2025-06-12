@@ -11,7 +11,7 @@ from infinityformer.model.model import InfinityFormerModel, InfinityFormerConfig
 
 def benchmark_throughput(model, device, sequence_lengths, batch_size=1, warmup_steps=5, benchmark_steps=10):
     """
-    Benchmarks the throughput of a model in tokens per second.
+    Benchmarks the inference throughput of a model in tokens per second.
 
     Args:
         model (torch.nn.Module): The model to benchmark.
@@ -22,10 +22,10 @@ def benchmark_throughput(model, device, sequence_lengths, batch_size=1, warmup_s
         benchmark_steps (int): Number of iterations to average for timing.
     """
     model.to(device)
-    model.train()  # Ensure model is in training mode for backward pass
+    model.eval()  # Set model to evaluation mode for inference
 
     print(f"\n{'='*40}")
-    print(f"  Starting Throughput Benchmark")
+    print(f"  Starting Inference Throughput Benchmark")
     print(f"{'='*40}")
     print(f"Device: {device}")
     print(f"Batch Size: {batch_size}")
@@ -38,33 +38,32 @@ def benchmark_throughput(model, device, sequence_lengths, batch_size=1, warmup_s
         input_ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_len), device=device)
         total_tokens = batch_size * seq_len
 
-        # Warmup phase
-        for _ in range(warmup_steps):
-            _ = model(input_ids)
-            # In a real scenario, you'd have loss.backward(), but for pure throughput,
-            # we can simulate a backward pass on a dummy loss from the output.
-            dummy_loss = model(input_ids).last_hidden_state.sum()
-            dummy_loss.backward()
-            model.zero_grad()
+        # Use autocast for mixed-precision (bfloat16 on Ampere/Hopper GPUs)
+        # This reduces memory usage significantly for long sequences.
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.no_grad():
+                # Warmup phase
+                for _ in range(warmup_steps):
+                    _ = model(input_ids)
 
-        # Benchmark phase
-        torch.cuda.synchronize()
-        start_time = time.time()
+                # Benchmark phase
+                torch.cuda.synchronize()
+                start_time = time.time()
 
-        for _ in range(benchmark_steps):
-            outputs = model(input_ids)
-            dummy_loss = outputs.last_hidden_state.sum()
-            dummy_loss.backward()
-            model.zero_grad()
-        
-        torch.cuda.synchronize()
-        end_time = time.time()
+                for _ in range(benchmark_steps):
+                    _ = model(input_ids)
+                
+                torch.cuda.synchronize()
+                end_time = time.time()
 
         total_time = end_time - start_time
         avg_time_per_step = total_time / benchmark_steps
         throughput = total_tokens / avg_time_per_step
 
         print(f"{seq_len:<20} | {throughput:>25.2f}")
+
+        # Clear cache between runs to handle memory fragmentation
+        torch.cuda.empty_cache()
 
     print(f"\n{'='*40}")
     print("  Benchmark Complete")

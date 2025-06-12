@@ -326,7 +326,7 @@ class LinearAttention(nn.Module):
             k = self.rotary_emb(k)
         
         # Apply kernel function to queries and keys
-        q = self.kernel(q) * self.scaling
+        q = self.kernel(q)
         k = self.kernel(k)
         
         # Compute output from current context (standard linear attention)
@@ -334,19 +334,34 @@ class LinearAttention(nn.Module):
         # v: [batch_size, seq_len, num_heads, head_dim]
         # attn_weights: [batch_size, num_heads, seq_len, seq_len]
         # output: [batch_size, seq_len, num_heads, head_dim]
-        attn_weights = torch.einsum('bqhd,bkhd->bhqk', q, k)
-        
-        # Apply attention mask if provided
+        # Transpose for scaled_dot_product_attention: [b, s, h, d] -> [b, h, s, d]
+        q_for_sdpa = q.transpose(1, 2)
+        k_for_sdpa = k.transpose(1, 2)
+        v_for_sdpa = v.transpose(1, 2)
+
+        # Convert attention mask to boolean mask for scaled_dot_product_attention
+        bool_attention_mask = None
         if attention_mask is not None:
             if attention_mask.dim() == 2:
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)  # [batch_size, 1, 1, seq_len]
-            attn_weights = attn_weights + attention_mask
-            
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            # The mask is float with large negative values for padding, convert to boolean
+            bool_attention_mask = attention_mask < 0
+
+        # Use PyTorch's optimized attention implementation (Flash Attention on compatible hardware)
+        context_output_sdpa = F.scaled_dot_product_attention(
+            q_for_sdpa, 
+            k_for_sdpa, 
+            v_for_sdpa, 
+            attn_mask=bool_attention_mask,
+            dropout_p=self.dropout.p if self.training else 0.0
+        )
+
+        # Transpose back: [b, h, s, d] -> [b, s, h, d]
+        context_output = context_output_sdpa.transpose(1, 2)
         
-        # Apply attention to values
-        context_output = torch.einsum('bhqk,bkhd->bqhd', attn_weights, v)
+        # attn_weights are not returned by the fused implementation, which is fine
+        # as the model doesn't use them when output_attentions=False.
+        attn_weights = None
         
         # Update memory with current key-value pairs if memory is enabled
         if self.use_memory:

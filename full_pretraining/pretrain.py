@@ -173,7 +173,7 @@ def main():
     tokenized_datasets = raw_datasets.map(
         tokenize_function,
         batched=True,
-        num_proc=args.preprocessing_num_workers,
+        num_proc=48,
         remove_columns=raw_datasets["train"].column_names,
     )
     
